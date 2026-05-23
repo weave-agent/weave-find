@@ -28,6 +28,17 @@ func TestDefinition(t *testing.T) {
 	assert.NotNil(t, def.Parameters)
 }
 
+func TestGuardianRequestForFind(t *testing.T) {
+	req := guardianRequest("/tmp/project")
+
+	assert.True(t, strings.HasPrefix(req.ID, "find-guardian-"))
+	assert.Equal(t, "find", req.ToolName)
+	assert.Equal(t, sdk.GuardianActionRead, req.Action)
+	assert.Equal(t, "/tmp/project", req.Path)
+	assert.Equal(t, "Find files in directory", req.Description)
+	assert.Equal(t, "find", req.Metadata["operation"])
+}
+
 func TestExecute(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -191,7 +202,9 @@ func TestExecuteSandboxDenied(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("data"), 0o644))
 
-	sb := &testSandboxer{allowReadFn: func(p string) bool { return false }}
+	sb := &testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied}, nil
+	}}
 	setSandboxer(sb)
 
 	t.Cleanup(func() { setSandboxer(nil) })
@@ -209,7 +222,9 @@ func TestExecuteSandboxAllowed(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "readable.txt"), []byte("data"), 0o644))
 
-	sb := &testSandboxer{allowReadFn: func(p string) bool { return true }}
+	sb := &testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+	}}
 	setSandboxer(sb)
 
 	t.Cleanup(func() { setSandboxer(nil) })
@@ -358,37 +373,38 @@ func (c *testConfig) SavePreferences(any) error                { return nil }
 func (c *testConfig) SaveProviderKey(_, _ string) error        { return nil }
 
 type testSandboxer struct {
-	allowReadFn  func(string) bool
-	allowWriteFn func(string) bool
-	wrapFn       func(cmd, dir string) (string, error)
+	requestExpansionFn func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error)
+	resolveExpansionFn func(context.Context, string, sdk.SandboxExpansionResolution) error
+	wrapFn             func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error)
 }
 
-func (ts *testSandboxer) WrapCommand(cmd, dir string) (string, error) {
+func (ts *testSandboxer) WrapCommand(ctx context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
 	if ts.wrapFn != nil {
-		return ts.wrapFn(cmd, dir)
+		return ts.wrapFn(ctx, req)
 	}
 
-	return cmd, nil
+	return sdk.SandboxCommand{Command: req.Command, Args: []string{req.Command}, WorkingDir: req.WorkingDir}, nil
 }
 
-func (ts *testSandboxer) AllowWrite(path string) bool {
-	if ts.allowWriteFn != nil {
-		return ts.allowWriteFn(path)
+func (ts *testSandboxer) Status(context.Context) (sdk.SandboxStatus, error) {
+	return sdk.SandboxStatus{Availability: sdk.SandboxAvailabilityAvailable}, nil
+}
+
+func (ts *testSandboxer) RequestExpansion(ctx context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+	if ts.requestExpansionFn != nil {
+		return ts.requestExpansionFn(ctx, req)
 	}
 
-	return true
+	return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
 }
 
-func (ts *testSandboxer) AllowRead(path string) bool {
-	if ts.allowReadFn != nil {
-		return ts.allowReadFn(path)
+func (ts *testSandboxer) ResolveExpansion(ctx context.Context, expansionID string, resolution sdk.SandboxExpansionResolution) error {
+	if ts.resolveExpansionFn != nil {
+		return ts.resolveExpansionFn(ctx, expansionID, resolution)
 	}
 
-	return true
+	return nil
 }
-
-func (ts *testSandboxer) Mode() string   { return "auto" }
-func (ts *testSandboxer) SetMode(string) {}
 
 func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {
 	if _, err := exec.LookPath("rg"); err != nil {
@@ -399,8 +415,13 @@ func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "public.go"), []byte("package main"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.go"), []byte("package secret"), 0o644))
 
-	sb := &testSandboxer{allowReadFn: func(p string) bool {
-		return !strings.Contains(p, "secret")
+	sb := &testSandboxer{requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		state := sdk.SandboxExpansionAllowed
+		if len(req.Filesystem) > 0 && strings.Contains(req.Filesystem[0].Path, "secret") {
+			state = sdk.SandboxExpansionDenied
+		}
+
+		return sdk.SandboxExpansion{State: state}, nil
 	}}
 	setSandboxer(sb)
 
