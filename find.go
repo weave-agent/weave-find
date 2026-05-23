@@ -197,6 +197,10 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		return sdk.ToolResult{Content: "error: pattern is required", IsError: true}, nil
 	}
 
+	if _, validateErr := filepath.Match(pattern, ""); validateErr != nil {
+		return sdk.ToolResult{Content: fmt.Sprintf("error: invalid pattern: %s", validateErr), IsError: true}, nil
+	}
+
 	path, _ := args[paramPath].(string)
 	if path == "" {
 		path = "."
@@ -224,10 +228,6 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 
 	if !info.IsDir() {
 		return sdk.ToolResult{Content: fmt.Sprintf("error: %s is not a directory", absPath), IsError: true}, nil
-	}
-
-	if _, validateErr := filepath.Match(pattern, ""); validateErr != nil {
-		return sdk.ToolResult{Content: fmt.Sprintf("error: invalid pattern: %s", validateErr), IsError: true}, nil
 	}
 
 	respectGitignore := true
@@ -332,21 +332,19 @@ func findWithStdlib(ctx context.Context, absPath, pattern string, respectGitigno
 		}
 
 		if d.IsDir() {
+			name := d.Name()
+			if respectGitignore && isSkipDir(name) {
+				return filepath.SkipDir
+			}
+
 			if rel != "." {
 				if allowed, _ := allowRead(walkPath); !allowed {
 					return filepath.SkipDir
 				}
 			}
 
-			name := d.Name()
-			if respectGitignore && isSkipDir(name) {
-				return filepath.SkipDir
-			}
-
 			if rel != "." && matchName(pattern, name, rel) {
-				if allowed, _ := allowRead(walkPath); allowed {
-					matches = append(matches, rel)
-				}
+				matches = append(matches, rel)
 			}
 
 			return nil

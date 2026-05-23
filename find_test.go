@@ -68,6 +68,38 @@ func TestExecuteGuardianReceivesAbsolutePath(t *testing.T) {
 	assert.Equal(t, filepath.Join(dir, "project"), gotPath)
 }
 
+func TestExecuteInvalidPatternSkipsGuardianAndSandbox(t *testing.T) {
+	dir := t.TempDir()
+
+	var guardianCalled bool
+	var sandboxCalled bool
+
+	setGuardian(&testGuardian{decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+		guardianCalled = true
+
+		return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
+	}})
+	setSandboxer(&testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		sandboxCalled = true
+
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+	}})
+	t.Cleanup(func() {
+		setGuardian(nil)
+		setSandboxer(nil)
+	})
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "[",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content, "invalid pattern")
+	assert.False(t, guardianCalled)
+	assert.False(t, sandboxCalled)
+}
+
 func TestExecute(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -772,6 +804,64 @@ func TestSandboxerSkipsDeniedDirectories(t *testing.T) {
 	assert.NotContains(t, result.Content, "hidden.go")
 	assert.Contains(t, requested, filepath.Join(dir, "secret"))
 	assert.NotContains(t, requested, filepath.Join(dir, "secret", "hidden.go"))
+}
+
+func TestStdlibWithSandboxerSkipsIgnoredDirectoriesBeforeSandbox(t *testing.T) {
+	origFind := ripgrep.Find
+	ripgrep.Find = func() string { return "" }
+	t.Cleanup(func() { ripgrep.Find = origFind })
+
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".git", "objects"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".git", "config"), []byte("config"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main"), 0o644))
+
+	var requested []string
+	setSandboxer(&testSandboxer{requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		require.Len(t, req.Filesystem, 1)
+		requested = append(requested, req.Filesystem[0].Path)
+
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+	}})
+	t.Cleanup(func() { setSandboxer(nil) })
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "*",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Content, "main.go")
+	assert.NotContains(t, result.Content, "config")
+	assert.NotContains(t, requested, filepath.Join(dir, ".git"))
+	assert.NotContains(t, requested, filepath.Join(dir, ".git", "objects"))
+	assert.NotContains(t, requested, filepath.Join(dir, ".git", "config"))
+}
+
+func TestStdlibWithSandboxerChecksMatchingDirectoryOnce(t *testing.T) {
+	origFind := ripgrep.Find
+	ripgrep.Find = func() string { return "" }
+	t.Cleanup(func() { ripgrep.Find = origFind })
+
+	dir := t.TempDir()
+	matchingDir := filepath.Join(dir, "target")
+	require.NoError(t, os.MkdirAll(matchingDir, 0o755))
+
+	requests := map[string]int{}
+	setSandboxer(&testSandboxer{requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		require.Len(t, req.Filesystem, 1)
+		requests[req.Filesystem[0].Path]++
+
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+	}})
+	t.Cleanup(func() { setSandboxer(nil) })
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "target",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Content, "target")
+	assert.Equal(t, 1, requests[matchingDir])
 }
 
 func TestSandboxerWithRipgrepRespectsGitignore(t *testing.T) {
