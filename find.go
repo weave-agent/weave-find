@@ -247,12 +247,15 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	return sdk.ToolResult{Content: result.Format(), IsError: false}, nil
 }
 
-// find tries rg first, then falls back to stdlib.
+// find tries rg first, then falls back to stdlib. When sandbox enforcement is
+// active, use the stdlib walker so access can be checked before descending.
 func (t *tool) find(ctx context.Context, absPath, pattern string, respectGitignore bool, readChecker sandboxReadChecker) []string {
-	if rgPath := ripgrep.Find(); rgPath != "" {
-		matches, err := findWithRipgrep(ctx, rgPath, absPath, pattern, respectGitignore, readChecker.Allow)
-		if err == nil {
-			return matches
+	if !readChecker.Active() {
+		if rgPath := ripgrep.Find(); rgPath != "" {
+			matches, err := findWithRipgrep(ctx, rgPath, absPath, pattern, respectGitignore, readChecker.Allow)
+			if err == nil {
+				return matches
+			}
 		}
 	}
 

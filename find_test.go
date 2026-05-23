@@ -864,39 +864,44 @@ func TestStdlibWithSandboxerChecksMatchingDirectoryOnce(t *testing.T) {
 	assert.Equal(t, 1, requests[matchingDir])
 }
 
-func TestSandboxerWithRipgrepRespectsGitignore(t *testing.T) {
-	if _, err := exec.LookPath("rg"); err != nil {
-		t.Skip("rg not in PATH")
-	}
-
+func TestSandboxerUsesStdlibWhenRipgrepAvailable(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, exec.Command("git", "init", dir).Run())
-	require.NoError(t, exec.Command("git", "-C", dir, "config", "user.email", "test@test.com").Run())
-	require.NoError(t, exec.Command("git", "-C", dir, "config", "user.name", "test").Run())
-	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored.txt\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "ignored.txt"), []byte("ignored"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "visible.txt"), []byte("visible"), 0o644))
-	require.NoError(t, exec.Command("git", "-C", dir, "add", ".gitignore").Run())
-	require.NoError(t, exec.Command("git", "-C", dir, "commit", "-m", "init").Run())
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "public"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "secret"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "public", "visible.go"), []byte("package public"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret", "hidden.go"), []byte("package secret"), 0o644))
+
+	fakeRg := filepath.Join(t.TempDir(), "rg")
+	marker := filepath.Join(t.TempDir(), "rg-called")
+	t.Setenv("WEAVE_FIND_RG_MARKER", marker)
+	require.NoError(t, os.WriteFile(fakeRg, []byte("#!/bin/sh\ntouch \"$WEAVE_FIND_RG_MARKER\"\nprintf 'secret/hidden.go\\000public/visible.go\\000'\n"), 0o755))
+
+	origFind := ripgrep.Find
+	ripgrep.Find = func() string { return fakeRg }
+	t.Cleanup(func() { ripgrep.Find = origFind })
 
 	var requested []string
 	setSandboxer(&testSandboxer{requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
 		require.Len(t, req.Filesystem, 1)
-		requested = append(requested, req.Filesystem[0].Path)
+		path := req.Filesystem[0].Path
+		requested = append(requested, path)
+		if path == filepath.Join(dir, "secret") {
+			return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied}, nil
+		}
 
 		return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
 	}})
 	t.Cleanup(func() { setSandboxer(nil) })
 
-	result, err := (&tool{cfg: &testConfig{respectGitignore: true}}).Execute(context.Background(), map[string]any{
-		"pattern": "*.txt",
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "*.go",
 		"path":    dir,
 	})
 	require.NoError(t, err)
-	assert.Contains(t, result.Content, "visible.txt")
-	assert.NotContains(t, result.Content, "ignored.txt")
-	assert.Contains(t, requested, filepath.Join(dir, "visible.txt"))
-	assert.NotContains(t, requested, filepath.Join(dir, "ignored.txt"))
+	assert.Contains(t, result.Content, filepath.Join("public", "visible.go"))
+	assert.NotContains(t, result.Content, "hidden.go")
+	assert.Contains(t, requested, filepath.Join(dir, "secret"))
+	assert.NoFileExists(t, marker)
 }
 
 func TestStdlibWithSandboxerFiltersDeniedPaths(t *testing.T) {
