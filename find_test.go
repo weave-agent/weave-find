@@ -864,7 +864,7 @@ func TestStdlibWithSandboxerChecksMatchingDirectoryOnce(t *testing.T) {
 	assert.Equal(t, 1, requests[matchingDir])
 }
 
-func TestSandboxerUsesStdlibWhenRipgrepAvailable(t *testing.T) {
+func TestSandboxerFiltersRipgrepResultsWhenAvailable(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "public"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "secret"), 0o755))
@@ -885,7 +885,7 @@ func TestSandboxerUsesStdlibWhenRipgrepAvailable(t *testing.T) {
 		require.Len(t, req.Filesystem, 1)
 		path := req.Filesystem[0].Path
 		requested = append(requested, path)
-		if path == filepath.Join(dir, "secret") {
+		if strings.Contains(path, "secret") {
 			return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied}, nil
 		}
 
@@ -900,8 +900,40 @@ func TestSandboxerUsesStdlibWhenRipgrepAvailable(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, result.Content, filepath.Join("public", "visible.go"))
 	assert.NotContains(t, result.Content, "hidden.go")
-	assert.Contains(t, requested, filepath.Join(dir, "secret"))
-	assert.NoFileExists(t, marker)
+	assert.Contains(t, requested, filepath.Join(dir, "secret", "hidden.go"))
+	assert.FileExists(t, marker)
+}
+
+func TestSandboxerWithRipgrepRespectsGitignore(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not in PATH")
+	}
+
+	dir := t.TempDir()
+
+	require.NoError(t, exec.Command("git", "init", dir).Run())
+	require.NoError(t, exec.Command("git", "-C", dir, "config", "user.email", "test@test.com").Run())
+	require.NoError(t, exec.Command("git", "-C", dir, "config", "user.name", "test").Run())
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored.txt\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ignored.txt"), []byte("ignored"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "visible.txt"), []byte("visible"), 0o644))
+
+	require.NoError(t, exec.Command("git", "-C", dir, "add", ".gitignore").Run())
+	require.NoError(t, exec.Command("git", "-C", dir, "commit", "-m", "init").Run())
+
+	setSandboxer(&testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+	}})
+	t.Cleanup(func() { setSandboxer(nil) })
+
+	result, err := (&tool{cfg: &testConfig{respectGitignore: true}}).Execute(context.Background(), map[string]any{
+		"pattern": "*.txt",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Content, "visible.txt")
+	assert.NotContains(t, result.Content, "ignored.txt")
 }
 
 func TestStdlibWithSandboxerFiltersDeniedPaths(t *testing.T) {
