@@ -2,6 +2,7 @@ package find
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,6 +254,159 @@ func TestExecuteSandboxNil(t *testing.T) {
 	assert.Contains(t, result.Content, "normal.txt")
 }
 
+func TestExecuteWithGuardian(t *testing.T) {
+	tests := []struct {
+		name      string
+		guardian  sdk.Guardian
+		wantError bool
+		check     func(t *testing.T, result sdk.ToolResult)
+	}{
+		{
+			name: "allow decision permits find",
+			guardian: &testGuardian{decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				assert.Equal(t, "find", req.ToolName)
+				assert.Equal(t, sdk.GuardianActionRead, req.Action)
+
+				return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
+			}},
+			check: func(t *testing.T, result sdk.ToolResult) {
+				assert.Contains(t, result.Content, "readable.txt")
+			},
+		},
+		{
+			name: "block decision returns guardian error",
+			guardian: &testGuardian{decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{
+					ID:        "decision-1",
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionBlock,
+					Reason:    "read blocked",
+					Profile:   "locked-down",
+				}, nil
+			}},
+			wantError: true,
+			check: func(t *testing.T, result sdk.ToolResult) {
+				assert.Contains(t, result.Content, "guardian: blocked")
+				assert.Contains(t, result.Content, "action: read")
+				assert.Contains(t, result.Content, "rule: locked-down")
+				assert.Contains(t, result.Content, "reason: read blocked")
+			},
+		},
+		{
+			name: "missing guardian permits find",
+			check: func(t *testing.T, result sdk.ToolResult) {
+				assert.Contains(t, result.Content, "readable.txt")
+			},
+		},
+		{
+			name: "guardian error returns tool error",
+			guardian: &testGuardian{decideFn: func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{}, errors.New("guardian unavailable")
+			}},
+			wantError: true,
+			check: func(t *testing.T, result sdk.ToolResult) {
+				assert.Contains(t, result.Content, "guardian: guardian unavailable")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "readable.txt"), []byte("data"), 0o644))
+
+			setGuardian(tt.guardian)
+			setSandboxer(nil)
+			t.Cleanup(func() {
+				setGuardian(nil)
+				setSandboxer(nil)
+			})
+
+			result, err := (&tool{}).Execute(context.Background(), map[string]any{
+				"pattern": "*.txt",
+				"path":    dir,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantError, result.IsError)
+
+			if tt.check != nil {
+				tt.check(t, result)
+			}
+		})
+	}
+}
+
+func TestExecuteGuardianSandboxOrdering(t *testing.T) {
+	t.Run("guardian allow runs before sandbox", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "readable.txt"), []byte("data"), 0o644))
+
+		var events []string
+		var guardianRequestID string
+
+		setGuardian(&testGuardian{decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+			events = append(events, "guardian")
+			guardianRequestID = req.ID
+
+			return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
+		}})
+		setSandboxer(&testSandboxer{requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+			events = append(events, "sandbox")
+			assert.Equal(t, guardianRequestID, req.Metadata["guardian_request_id"])
+
+			return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied}, nil
+		}})
+		t.Cleanup(func() {
+			setGuardian(nil)
+			setSandboxer(nil)
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{
+			"pattern": "*.txt",
+			"path":    dir,
+		})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "sandbox: read denied")
+		assert.Equal(t, []string{"guardian", "sandbox"}, events)
+	})
+
+	t.Run("guardian block skips sandbox", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "readable.txt"), []byte("data"), 0o644))
+
+		var events []string
+
+		setGuardian(&testGuardian{decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+			events = append(events, "guardian")
+
+			return sdk.GuardianDecision{
+				RequestID: req.ID,
+				Action:    sdk.GuardianDecisionBlock,
+				Reason:    "no reads",
+			}, nil
+		}})
+		setSandboxer(&testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+			events = append(events, "sandbox")
+
+			return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+		}})
+		t.Cleanup(func() {
+			setGuardian(nil)
+			setSandboxer(nil)
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{
+			"pattern": "*.txt",
+			"path":    dir,
+		})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian: blocked")
+		assert.Equal(t, []string{"guardian"}, events)
+	})
+}
+
 func TestRespectGitignore(t *testing.T) {
 	if _, err := exec.LookPath("rg"); err != nil {
 		t.Skip("rg not in PATH")
@@ -404,6 +558,36 @@ func (ts *testSandboxer) ResolveExpansion(ctx context.Context, expansionID strin
 	}
 
 	return nil
+}
+
+type testGuardian struct {
+	decideFn   func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error)
+	resolveFn  func(context.Context, string, sdk.GuardianResolution) error
+	snapshotFn func(context.Context) (sdk.GuardianSnapshot, error)
+}
+
+func (tg *testGuardian) Decide(ctx context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+	if tg.decideFn != nil {
+		return tg.decideFn(ctx, req)
+	}
+
+	return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
+}
+
+func (tg *testGuardian) Resolve(ctx context.Context, decisionID string, resolution sdk.GuardianResolution) error {
+	if tg.resolveFn != nil {
+		return tg.resolveFn(ctx, decisionID, resolution)
+	}
+
+	return nil
+}
+
+func (tg *testGuardian) Snapshot(ctx context.Context) (sdk.GuardianSnapshot, error) {
+	if tg.snapshotFn != nil {
+		return tg.snapshotFn(ctx)
+	}
+
+	return sdk.GuardianSnapshot{}, nil
 }
 
 func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {

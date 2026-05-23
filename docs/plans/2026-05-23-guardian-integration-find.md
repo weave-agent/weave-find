@@ -40,16 +40,16 @@ Add guardian policy enforcement to the `find` tool so that filesystem traversal 
 - [x] Run find tests — must pass before next task
 
 ### Task 2: Add guardian tests to find_test.go
-- [ ] Write `TestExecuteWithGuardian` with subtests:
+- [x] Write `TestExecuteWithGuardian` with subtests:
   - "allow decision permits find"
   - "block decision returns guardian error"
   - "missing guardian permits find"
   - "guardian error returns tool error"
-- [ ] Write `TestExecuteGuardianSandboxOrdering`:
+- [x] Write `TestExecuteGuardianSandboxOrdering`:
   - "guardian allow runs before sandbox"
   - "guardian block skips sandbox"
-- [ ] Add `testGuardian` mock helper
-- [ ] Run find tests — must pass
+- [x] Add `testGuardian` mock helper
+- [x] Run find tests — must pass
 
 ### Task 3: Verify and cleanup
 - [ ] Run `make lint` in find extension directory
