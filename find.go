@@ -3,8 +3,6 @@ package find
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -14,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/weave-agent/weave/sdk"
 	"github.com/weave-agent/weave/utils/ripgrep"
@@ -70,23 +67,27 @@ func getGuardian() sdk.Guardian {
 	return g
 }
 
+func registerBusHandlers(bus sdk.Bus) {
+	bus.On(sdk.GuardianRegisteredTopic, func(ev sdk.Event) error {
+		if g, ok := ev.Payload.(sdk.Guardian); ok {
+			setGuardian(g)
+		}
+
+		return nil
+	})
+
+	bus.On(sdk.SandboxRegisteredTopic, func(ev sdk.Event) error {
+		if s, ok := ev.Payload.(sdk.Sandboxer); ok {
+			setSandboxer(s)
+		}
+
+		return nil
+	})
+}
+
 func init() {
 	sdk.OnBusReady(func(bus sdk.Bus) {
-		bus.On(sdk.GuardianRegisteredTopic, func(ev sdk.Event) error {
-			if g, ok := ev.Payload.(sdk.Guardian); ok {
-				setGuardian(g)
-			}
-
-			return nil
-		})
-
-		bus.On(sdk.SandboxRegisteredTopic, func(ev sdk.Event) error {
-			if s, ok := ev.Payload.(sdk.Sandboxer); ok {
-				setSandboxer(s)
-			}
-
-			return nil
-		})
+		registerBusHandlers(bus)
 	})
 
 	sdk.RegisterTool[struct{}]("find", func(cfg sdk.Config, _ sdk.PreferenceReader, _ struct{}) (sdk.Tool, error) {
@@ -119,12 +120,7 @@ func (t *tool) Definition() sdk.ToolDef {
 }
 
 func newRequestID(prefix string) string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err == nil {
-		return prefix + "-" + hex.EncodeToString(b[:])
-	}
-
-	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), requestSeq.Add(1))
+	return fmt.Sprintf("%s-%d", prefix, requestSeq.Add(1))
 }
 
 func guardianRequest(path string) sdk.GuardianRequest {
@@ -216,8 +212,9 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		return sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}, nil
 	}
 
-	if !allowRead(ctx, absPath, guardianReq.ID) {
-		return sdk.ToolResult{Content: "sandbox: read denied — path is protected", IsError: true}, nil
+	allowRead := sandboxReadChecker(ctx, guardianReq.ID)
+	if allowed, reason := allowRead(absPath); !allowed {
+		return sdk.ToolResult{Content: formatSandboxDenied(reason), IsError: true}, nil
 	}
 
 	info, err := os.Stat(absPath)
@@ -238,7 +235,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		respectGitignore = t.cfg.RespectGitignore()
 	}
 
-	matches := t.find(ctx, absPath, pattern, respectGitignore, guardianReq.ID)
+	matches := t.find(ctx, absPath, pattern, respectGitignore, allowRead)
 
 	if len(matches) == 0 {
 		return sdk.ToolResult{Content: "no files found", IsError: false}, nil
@@ -251,20 +248,20 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 }
 
 // find tries rg first, then falls back to stdlib.
-func (t *tool) find(ctx context.Context, absPath, pattern string, respectGitignore bool, guardianRequestID string) []string {
+func (t *tool) find(ctx context.Context, absPath, pattern string, respectGitignore bool, allowRead func(string) (bool, string)) []string {
 	// Use rg when available. Denied paths are filtered from results by
-	// AllowRead checks in filterResults.
+	// sandbox checks in filterResults.
 	if rgPath := ripgrep.Find(); rgPath != "" {
-		matches, err := findWithRipgrep(ctx, rgPath, absPath, pattern, respectGitignore, guardianRequestID)
+		matches, err := findWithRipgrep(ctx, rgPath, absPath, pattern, respectGitignore, allowRead)
 		if err == nil {
 			return matches
 		}
 	}
 
-	return findWithStdlib(ctx, absPath, pattern, respectGitignore, guardianRequestID)
+	return findWithStdlib(ctx, absPath, pattern, respectGitignore, allowRead)
 }
 
-func findWithRipgrep(ctx context.Context, rgPath, absPath, pattern string, respectGitignore bool, guardianRequestID string) ([]string, error) {
+func findWithRipgrep(ctx context.Context, rgPath, absPath, pattern string, respectGitignore bool, allowRead func(string) (bool, string)) ([]string, error) {
 	args := []string{"--files", "--null", "--hidden"}
 
 	if !respectGitignore {
@@ -281,11 +278,11 @@ func findWithRipgrep(ctx context.Context, rgPath, absPath, pattern string, respe
 		return nil, fmt.Errorf("rg: %w", err)
 	}
 
-	return filterResults(ctx, out, absPath, pattern, respectGitignore, guardianRequestID)
+	return filterResults(out, absPath, pattern, respectGitignore, allowRead)
 }
 
 // filterResults parses null-separated rg output, applies glob matching and skip-dir filtering.
-func filterResults(ctx context.Context, data []byte, baseDir, pattern string, respectGitignore bool, guardianRequestID string) ([]string, error) {
+func filterResults(data []byte, baseDir, pattern string, respectGitignore bool, allowRead func(string) (bool, string)) ([]string, error) {
 	var matches []string
 
 	entries := bytes.SplitSeq(data, []byte{0})
@@ -304,7 +301,7 @@ func filterResults(ctx context.Context, data []byte, baseDir, pattern string, re
 			continue
 		}
 
-		if !allowRead(ctx, filepath.Join(baseDir, text), guardianRequestID) {
+		if allowed, _ := allowRead(filepath.Join(baseDir, text)); !allowed {
 			continue
 		}
 
@@ -322,7 +319,7 @@ func isSkipPath(rel string) bool {
 	return slices.ContainsFunc(strings.Split(rel, string(filepath.Separator)), isSkipDir)
 }
 
-func findWithStdlib(ctx context.Context, absPath, pattern string, respectGitignore bool, guardianRequestID string) []string {
+func findWithStdlib(ctx context.Context, absPath, pattern string, respectGitignore bool, allowRead func(string) (bool, string)) []string {
 	var matches []string
 
 	err := filepath.WalkDir(absPath, func(walkPath string, d fs.DirEntry, walkErr error) error {
@@ -342,15 +339,19 @@ func findWithStdlib(ctx context.Context, absPath, pattern string, respectGitigno
 				return filepath.SkipDir
 			}
 
-			if rel != "." && matchName(pattern, name, rel) && allowRead(ctx, walkPath, guardianRequestID) {
-				matches = append(matches, rel)
+			if rel != "." && matchName(pattern, name, rel) {
+				if allowed, _ := allowRead(walkPath); allowed {
+					matches = append(matches, rel)
+				}
 			}
 
 			return nil
 		}
 
-		if matchName(pattern, d.Name(), rel) && allowRead(ctx, walkPath, guardianRequestID) {
-			matches = append(matches, rel)
+		if matchName(pattern, d.Name(), rel) {
+			if allowed, _ := allowRead(walkPath); allowed {
+				matches = append(matches, rel)
+			}
 		}
 
 		return nil
@@ -444,27 +445,51 @@ func isSkipDir(name string) bool {
 	return name == ".git" || name == "node_modules" || name == ".hg" || name == ".svn"
 }
 
-func allowRead(ctx context.Context, path, guardianRequestID string) bool {
+func sandboxReadChecker(ctx context.Context, guardianRequestID string) func(string) (bool, string) {
 	s := getSandboxer()
 	if s == nil {
-		return true
+		return func(string) (bool, string) { return true, "" }
 	}
 
-	expansion, err := s.RequestExpansion(ctx, sdk.SandboxExpansionRequest{
-		ID:      newRequestID("find-sandbox"),
-		Command: "find",
-		Reason:  "Find files in directory",
-		Filesystem: []sdk.SandboxFilesystemExpansion{
-			{Path: path, Access: sdk.SandboxFilesystemRead},
-		},
-		Metadata: map[string]any{
-			"operation":           "find",
-			"guardian_request_id": guardianRequestID,
-		},
-	})
-	if err != nil {
-		return false
+	return func(path string) (bool, string) {
+		expansion, err := s.RequestExpansion(ctx, sdk.SandboxExpansionRequest{
+			ID:      newRequestID("find-sandbox"),
+			Command: "find",
+			Reason:  "Find files in directory",
+			Filesystem: []sdk.SandboxFilesystemExpansion{
+				{Path: path, Access: sdk.SandboxFilesystemRead},
+			},
+			Metadata: map[string]any{
+				"operation":           "find",
+				"guardian_request_id": guardianRequestID,
+			},
+		})
+		if err != nil {
+			return false, err.Error()
+		}
+
+		if expansion.State == sdk.SandboxExpansionAllowed {
+			return true, ""
+		}
+
+		if expansion.Reason != "" {
+			return false, expansion.Reason
+		}
+		if expansion.Resolution != nil && expansion.Resolution.Reason != "" {
+			return false, expansion.Resolution.Reason
+		}
+		if expansion.State != "" {
+			return false, "sandbox expansion " + string(expansion.State)
+		}
+
+		return false, ""
+	}
+}
+
+func formatSandboxDenied(reason string) string {
+	if reason == "" {
+		return "sandbox: read denied — path is protected"
 	}
 
-	return expansion.State == sdk.SandboxExpansionAllowed
+	return "sandbox: read denied — path is protected\nreason: " + reason
 }

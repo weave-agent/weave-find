@@ -204,7 +204,7 @@ func TestExecuteSandboxDenied(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("data"), 0o644))
 
 	sb := &testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
-		return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied}, nil
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied, Reason: "profile denied read"}, nil
 	}}
 	setSandboxer(sb)
 
@@ -217,6 +217,56 @@ func TestExecuteSandboxDenied(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.IsError)
 	assert.Contains(t, result.Content, "sandbox: read denied")
+	assert.Contains(t, result.Content, "reason: profile denied read")
+}
+
+func TestExecuteSandboxExpansionFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		expansion sdk.SandboxExpansion
+		err       error
+		want      string
+	}{
+		{
+			name: "request error returns reason",
+			err:  errors.New("sandbox unavailable"),
+			want: "reason: sandbox unavailable",
+		},
+		{
+			name:      "pending expansion returns state",
+			expansion: sdk.SandboxExpansion{State: sdk.SandboxExpansionPending},
+			want:      "reason: sandbox expansion pending",
+		},
+		{
+			name: "denied expansion uses resolution reason",
+			expansion: sdk.SandboxExpansion{
+				State:      sdk.SandboxExpansionDenied,
+				Resolution: &sdk.SandboxExpansionResolution{Reason: "operator denied"},
+			},
+			want: "reason: operator denied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("data"), 0o644))
+
+			setSandboxer(&testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return tt.expansion, tt.err
+			}})
+			t.Cleanup(func() { setSandboxer(nil) })
+
+			result, err := (&tool{}).Execute(context.Background(), map[string]any{
+				"pattern": "*.txt",
+				"path":    dir,
+			})
+			require.NoError(t, err)
+			assert.True(t, result.IsError)
+			assert.Contains(t, result.Content, "sandbox: read denied")
+			assert.Contains(t, result.Content, tt.want)
+		})
+	}
 }
 
 func TestExecuteSandboxAllowed(t *testing.T) {
@@ -334,6 +384,70 @@ func TestExecuteWithGuardian(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecuteGuardianUnresolvedDecisionBlocks(t *testing.T) {
+	tests := []struct {
+		name     string
+		decision sdk.GuardianDecisionAction
+	}{
+		{name: "ask decision blocks", decision: sdk.GuardianDecisionAsk},
+		{name: "unknown decision blocks", decision: sdk.GuardianDecisionAction("review")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "readable.txt"), []byte("data"), 0o644))
+
+			var sandboxCalled bool
+			setGuardian(&testGuardian{decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{RequestID: req.ID, Action: tt.decision}, nil
+			}})
+			setSandboxer(&testSandboxer{requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				sandboxCalled = true
+
+				return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+			}})
+			t.Cleanup(func() {
+				setGuardian(nil)
+				setSandboxer(nil)
+			})
+
+			result, err := (&tool{}).Execute(context.Background(), map[string]any{
+				"pattern": "*.txt",
+				"path":    dir,
+			})
+			require.NoError(t, err)
+			assert.True(t, result.IsError)
+			assert.Contains(t, result.Content, "guardian: blocked")
+			assert.Contains(t, result.Content, "reason: guardian returned unresolved approval decision")
+			assert.False(t, sandboxCalled)
+		})
+	}
+}
+
+func TestBusRegistrationHandlers(t *testing.T) {
+	bus := &testBus{handlers: map[string][]sdk.Handler{}}
+	registerBusHandlers(bus)
+
+	guardian := &testGuardian{}
+	sandboxer := &testSandboxer{}
+
+	bus.Publish(sdk.Event{Topic: sdk.GuardianRegisteredTopic, Payload: "not a guardian"})
+	bus.Publish(sdk.Event{Topic: sdk.SandboxRegisteredTopic, Payload: "not a sandboxer"})
+	assert.Nil(t, getGuardian())
+	assert.Nil(t, getSandboxer())
+
+	bus.Publish(sdk.Event{Topic: sdk.GuardianRegisteredTopic, Payload: guardian})
+	bus.Publish(sdk.Event{Topic: sdk.SandboxRegisteredTopic, Payload: sandboxer})
+	t.Cleanup(func() {
+		setGuardian(nil)
+		setSandboxer(nil)
+	})
+
+	assert.Same(t, guardian, getGuardian())
+	assert.Same(t, sandboxer, getSandboxer())
 }
 
 func TestExecuteGuardianSandboxOrdering(t *testing.T) {
@@ -528,15 +642,9 @@ func (c *testConfig) SaveProviderKey(_, _ string) error        { return nil }
 
 type testSandboxer struct {
 	requestExpansionFn func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error)
-	resolveExpansionFn func(context.Context, string, sdk.SandboxExpansionResolution) error
-	wrapFn             func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error)
 }
 
-func (ts *testSandboxer) WrapCommand(ctx context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
-	if ts.wrapFn != nil {
-		return ts.wrapFn(ctx, req)
-	}
-
+func (ts *testSandboxer) WrapCommand(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
 	return sdk.SandboxCommand{Command: req.Command, Args: []string{req.Command}, WorkingDir: req.WorkingDir}, nil
 }
 
@@ -552,18 +660,12 @@ func (ts *testSandboxer) RequestExpansion(ctx context.Context, req sdk.SandboxEx
 	return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
 }
 
-func (ts *testSandboxer) ResolveExpansion(ctx context.Context, expansionID string, resolution sdk.SandboxExpansionResolution) error {
-	if ts.resolveExpansionFn != nil {
-		return ts.resolveExpansionFn(ctx, expansionID, resolution)
-	}
-
+func (ts *testSandboxer) ResolveExpansion(context.Context, string, sdk.SandboxExpansionResolution) error {
 	return nil
 }
 
 type testGuardian struct {
-	decideFn   func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error)
-	resolveFn  func(context.Context, string, sdk.GuardianResolution) error
-	snapshotFn func(context.Context) (sdk.GuardianSnapshot, error)
+	decideFn func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error)
 }
 
 func (tg *testGuardian) Decide(ctx context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
@@ -574,19 +676,11 @@ func (tg *testGuardian) Decide(ctx context.Context, req sdk.GuardianRequest) (sd
 	return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
 }
 
-func (tg *testGuardian) Resolve(ctx context.Context, decisionID string, resolution sdk.GuardianResolution) error {
-	if tg.resolveFn != nil {
-		return tg.resolveFn(ctx, decisionID, resolution)
-	}
-
+func (tg *testGuardian) Resolve(context.Context, string, sdk.GuardianResolution) error {
 	return nil
 }
 
-func (tg *testGuardian) Snapshot(ctx context.Context) (sdk.GuardianSnapshot, error) {
-	if tg.snapshotFn != nil {
-		return tg.snapshotFn(ctx)
-	}
-
+func (tg *testGuardian) Snapshot(context.Context) (sdk.GuardianSnapshot, error) {
 	return sdk.GuardianSnapshot{}, nil
 }
 
@@ -619,3 +713,49 @@ func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {
 	assert.Contains(t, result.Content, "public.go")
 	assert.NotContains(t, result.Content, "secret.go")
 }
+
+func TestStdlibWithSandboxerFiltersDeniedPaths(t *testing.T) {
+	origFind := ripgrep.Find
+	ripgrep.Find = func() string { return "" }
+	t.Cleanup(func() { ripgrep.Find = origFind })
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "public.go"), []byte("package main"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.go"), []byte("package secret"), 0o644))
+
+	setSandboxer(&testSandboxer{requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		state := sdk.SandboxExpansionAllowed
+		if len(req.Filesystem) > 0 && strings.Contains(req.Filesystem[0].Path, "secret") {
+			state = sdk.SandboxExpansionDenied
+		}
+
+		return sdk.SandboxExpansion{State: state}, nil
+	}})
+	t.Cleanup(func() { setSandboxer(nil) })
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "*.go",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Content, "public.go")
+	assert.NotContains(t, result.Content, "secret.go")
+}
+
+type testBus struct {
+	handlers map[string][]sdk.Handler
+}
+
+func (tb *testBus) Publish(ev sdk.Event) {
+	for _, handler := range tb.handlers[ev.Topic] {
+		_ = handler(ev)
+	}
+}
+
+func (tb *testBus) On(topic string, h sdk.Handler) {
+	tb.handlers[topic] = append(tb.handlers[topic], h)
+}
+
+func (tb *testBus) OnAll(sdk.Handler) {}
+func (tb *testBus) Off(sdk.Handler)   {}
+func (tb *testBus) Close() error      { return nil }

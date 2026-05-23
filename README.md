@@ -16,6 +16,24 @@ The `--name find` ensures your fork shadows the official extension.
 weave install github.com/weave-agent/weave-find --name find
 ```
 
+## Behavior
+
+`find` searches a directory for files matching a glob pattern. It uses `rg`
+when available and falls back to the Go standard library walker when `rg` is
+absent or fails.
+
+When a guardian is registered, `find` sends an `sdk.GuardianActionRead` request
+before resolving or traversing the directory. Allow decisions continue the
+search, block decisions return `guardian: blocked`, unresolved ask decisions are
+treated as blocks, and guardian errors return a tool error. If no guardian is
+registered, the search is permitted to continue.
+
+When a sandboxer is registered, `find` checks read access with
+`sdk.Sandboxer.RequestExpansion`. A denied root directory returns
+`sandbox: read denied — path is protected`; denied per-result paths are filtered
+from the returned matches. Sandbox expansion metadata includes the related
+`guardian_request_id` for correlation.
+
 ## Development
 
 ```bash
@@ -26,6 +44,7 @@ cd weave-find
 echo 'replace github.com/weave-agent/weave => /path/to/local/weave' >> go.mod
 
 go test ./...
+go vet ./...
 ```
 
 ## License

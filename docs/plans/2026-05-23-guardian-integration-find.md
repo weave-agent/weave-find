@@ -8,7 +8,7 @@ Add guardian policy enforcement to the `find` tool so that filesystem traversal 
 - **Test file**: `find_test.go`
 - **Reference pattern**: `weave-bash` extension (`bash.go` lines 68-317)
 - **Guardian action**: `sdk.GuardianActionRead`
-- The find tool already has sandbox integration (`sandboxer.AllowRead(absPath)` at line 106); guardian must run *before* sandbox.
+- The find tool has sandbox integration through `sdk.Sandboxer.RequestExpansion`; guardian must run *before* sandbox.
 - Note: `ask` profile auto-allows reads, but custom profiles may block or log them.
 
 ## Development Approach
@@ -37,6 +37,7 @@ Add guardian policy enforcement to the `find` tool so that filesystem traversal 
 - [x] Add `formatGuardianBlock()` helper (same as bash)
 - [x] Call `checkGuardian()` at start of `Execute()`, before directory traversal and sandbox checks
 - [x] Pass `guardianReq.ID` into sandbox metadata for linkage
+- [x] Use `RequestExpansion` for root path checks and per-result sandbox filtering
 - [x] Run find tests — must pass before next task
 
 ### Task 2: Add guardian tests to find_test.go
@@ -78,9 +79,10 @@ func guardianRequest(path string) sdk.GuardianRequest {
 1. Validate `path` parameter
 2. **Guardian check** (`checkGuardian`) — if blocked, return error
 3. Resolve and validate directory path
-4. Sandbox check (`sandboxer.AllowRead`)
-5. Walk directory, collect results
+4. Root sandbox check (`sandboxer.RequestExpansion`)
+5. Walk directory or parse ripgrep output
+6. Filter matching result paths through per-result sandbox expansion checks
 
 ## Post-Completion
-- Manual verification: test find tool with `ask` profile — should auto-allow reads
-- Test with custom profile that blocks reads — should block
+- [ ] Manual verification with `ask` profile - should auto-allow reads (not performed in this automated pass)
+- [ ] Manual verification with custom blocking profile - should block (not performed in this automated pass)
