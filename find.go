@@ -249,9 +249,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 
 // find tries rg first, then falls back to stdlib.
 func (t *tool) find(ctx context.Context, absPath, pattern string, respectGitignore bool, readChecker sandboxReadChecker) []string {
-	// Use rg when available and sandboxing is inactive. With sandboxing active,
-	// stdlib traversal can skip denied directories before descending.
-	if rgPath := ripgrep.Find(); rgPath != "" && !readChecker.Active() {
+	if rgPath := ripgrep.Find(); rgPath != "" {
 		matches, err := findWithRipgrep(ctx, rgPath, absPath, pattern, respectGitignore, readChecker.Allow)
 		if err == nil {
 			return matches
