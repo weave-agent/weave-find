@@ -77,8 +77,8 @@ func guardianRequest(path string) sdk.GuardianRequest {
 
 ### Execute ordering
 1. Validate `path` parameter
-2. **Guardian check** (`checkGuardian`) — if blocked, return error
-3. Resolve and validate directory path
+2. Resolve the directory path to an absolute path
+3. **Guardian check** (`checkGuardian`) — if blocked, return error
 4. Root sandbox check (`sandboxer.RequestExpansion`)
 5. Walk directory or parse ripgrep output
 6. Filter matching result paths through per-result sandbox expansion checks

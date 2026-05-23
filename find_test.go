@@ -40,6 +40,34 @@ func TestGuardianRequestForFind(t *testing.T) {
 	assert.Equal(t, "find", req.Metadata["operation"])
 }
 
+func TestExecuteGuardianReceivesAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "project"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "project", "readable.txt"), []byte("data"), 0o644))
+
+	t.Chdir(dir)
+
+	var gotPath string
+	setGuardian(&testGuardian{decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+		gotPath = req.Path
+
+		return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
+	}})
+	setSandboxer(nil)
+	t.Cleanup(func() {
+		setGuardian(nil)
+		setSandboxer(nil)
+	})
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "*.txt",
+		"path":    "./project",
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+	assert.Equal(t, filepath.Join(dir, "project"), gotPath)
+}
+
 func TestExecute(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -684,11 +712,7 @@ func (tg *testGuardian) Snapshot(context.Context) (sdk.GuardianSnapshot, error) 
 	return sdk.GuardianSnapshot{}, nil
 }
 
-func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {
-	if _, err := exec.LookPath("rg"); err != nil {
-		t.Skip("rg not in PATH")
-	}
-
+func TestSandboxerFiltersDeniedPaths(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "public.go"), []byte("package main"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.go"), []byte("package secret"), 0o644))
@@ -712,6 +736,38 @@ func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, result.Content, "public.go")
 	assert.NotContains(t, result.Content, "secret.go")
+}
+
+func TestSandboxerSkipsDeniedDirectories(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "public"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "secret"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "public", "visible.go"), []byte("package public"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret", "hidden.go"), []byte("package secret"), 0o644))
+
+	var requested []string
+	setSandboxer(&testSandboxer{requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+		require.Len(t, req.Filesystem, 1)
+
+		path := req.Filesystem[0].Path
+		requested = append(requested, path)
+		if path == filepath.Join(dir, "secret") {
+			return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied}, nil
+		}
+
+		return sdk.SandboxExpansion{State: sdk.SandboxExpansionAllowed}, nil
+	}})
+	t.Cleanup(func() { setSandboxer(nil) })
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "*.go",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Content, filepath.Join("public", "visible.go"))
+	assert.NotContains(t, result.Content, "hidden.go")
+	assert.Contains(t, requested, filepath.Join(dir, "secret"))
+	assert.NotContains(t, requested, filepath.Join(dir, "secret", "hidden.go"))
 }
 
 func TestStdlibWithSandboxerFiltersDeniedPaths(t *testing.T) {

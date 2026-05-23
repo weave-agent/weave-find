@@ -3,7 +3,7 @@
 ## Guardian/Sandbox Integration
 
 - Register runtime integrations through `registerBusHandlers`, which listens for `sdk.GuardianRegisteredTopic` and `sdk.SandboxRegisteredTopic`.
-- Guardian checks run before path resolution, sandbox expansion, and traversal.
+- Guardian checks run after lexical absolute-path normalization and before sandbox expansion and traversal.
 - `find` uses `sdk.GuardianActionRead`; unresolved guardian decisions, including `ask`, are treated as blocks.
 - Sandbox access uses `sdk.Sandboxer.RequestExpansion`, not a direct read predicate.
 - Root sandbox denial returns a tool error. Per-result sandbox denial filters that result from ripgrep and stdlib output.

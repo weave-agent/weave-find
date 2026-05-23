@@ -23,7 +23,7 @@ when available and falls back to the Go standard library walker when `rg` is
 absent or fails.
 
 When a guardian is registered, `find` sends an `sdk.GuardianActionRead` request
-before resolving or traversing the directory. Allow decisions continue the
+for the absolute search path before traversing the directory. Allow decisions continue the
 search, block decisions return `guardian: blocked`, unresolved ask decisions are
 treated as blocks, and guardian errors return a tool error. If no guardian is
 registered, the search is permitted to continue.

@@ -202,18 +202,18 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		path = "."
 	}
 
-	guardianReq, guardianResult := checkGuardian(ctx, path)
-	if guardianResult != nil {
-		return *guardianResult, nil
-	}
-
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}, nil
 	}
 
-	allowRead := sandboxReadChecker(ctx, guardianReq.ID)
-	if allowed, reason := allowRead(absPath); !allowed {
+	guardianReq, guardianResult := checkGuardian(ctx, absPath)
+	if guardianResult != nil {
+		return *guardianResult, nil
+	}
+
+	readChecker := newSandboxReadChecker(ctx, guardianReq.ID)
+	if allowed, reason := readChecker.Allow(absPath); !allowed {
 		return sdk.ToolResult{Content: formatSandboxDenied(reason), IsError: true}, nil
 	}
 
@@ -235,7 +235,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		respectGitignore = t.cfg.RespectGitignore()
 	}
 
-	matches := t.find(ctx, absPath, pattern, respectGitignore, allowRead)
+	matches := t.find(ctx, absPath, pattern, respectGitignore, readChecker)
 
 	if len(matches) == 0 {
 		return sdk.ToolResult{Content: "no files found", IsError: false}, nil
@@ -248,17 +248,17 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 }
 
 // find tries rg first, then falls back to stdlib.
-func (t *tool) find(ctx context.Context, absPath, pattern string, respectGitignore bool, allowRead func(string) (bool, string)) []string {
-	// Use rg when available. Denied paths are filtered from results by
-	// sandbox checks in filterResults.
-	if rgPath := ripgrep.Find(); rgPath != "" {
-		matches, err := findWithRipgrep(ctx, rgPath, absPath, pattern, respectGitignore, allowRead)
+func (t *tool) find(ctx context.Context, absPath, pattern string, respectGitignore bool, readChecker sandboxReadChecker) []string {
+	// Use rg when available and sandboxing is inactive. With sandboxing active,
+	// stdlib traversal can skip denied directories before descending.
+	if rgPath := ripgrep.Find(); rgPath != "" && !readChecker.Active() {
+		matches, err := findWithRipgrep(ctx, rgPath, absPath, pattern, respectGitignore, readChecker.Allow)
 		if err == nil {
 			return matches
 		}
 	}
 
-	return findWithStdlib(ctx, absPath, pattern, respectGitignore, allowRead)
+	return findWithStdlib(ctx, absPath, pattern, respectGitignore, readChecker.Allow)
 }
 
 func findWithRipgrep(ctx context.Context, rgPath, absPath, pattern string, respectGitignore bool, allowRead func(string) (bool, string)) ([]string, error) {
@@ -301,12 +301,12 @@ func filterResults(data []byte, baseDir, pattern string, respectGitignore bool, 
 			continue
 		}
 
-		if allowed, _ := allowRead(filepath.Join(baseDir, text)); !allowed {
-			continue
-		}
-
 		name := filepath.Base(text)
 		if matchName(pattern, name, rel) {
+			if allowed, _ := allowRead(filepath.Join(baseDir, text)); !allowed {
+				continue
+			}
+
 			matches = append(matches, rel)
 		}
 	}
@@ -334,6 +334,12 @@ func findWithStdlib(ctx context.Context, absPath, pattern string, respectGitigno
 		}
 
 		if d.IsDir() {
+			if rel != "." {
+				if allowed, _ := allowRead(walkPath); !allowed {
+					return filepath.SkipDir
+				}
+			}
+
 			name := d.Name()
 			if respectGitignore && isSkipDir(name) {
 				return filepath.SkipDir
@@ -445,13 +451,26 @@ func isSkipDir(name string) bool {
 	return name == ".git" || name == "node_modules" || name == ".hg" || name == ".svn"
 }
 
-func sandboxReadChecker(ctx context.Context, guardianRequestID string) func(string) (bool, string) {
+type sandboxReadChecker struct {
+	active bool
+	allow  func(string) (bool, string)
+}
+
+func (src sandboxReadChecker) Active() bool {
+	return src.active
+}
+
+func (src sandboxReadChecker) Allow(path string) (bool, string) {
+	return src.allow(path)
+}
+
+func newSandboxReadChecker(ctx context.Context, guardianRequestID string) sandboxReadChecker {
 	s := getSandboxer()
 	if s == nil {
-		return func(string) (bool, string) { return true, "" }
+		return sandboxReadChecker{allow: func(string) (bool, string) { return true, "" }}
 	}
 
-	return func(path string) (bool, string) {
+	return sandboxReadChecker{active: true, allow: func(path string) (bool, string) {
 		expansion, err := s.RequestExpansion(ctx, sdk.SandboxExpansionRequest{
 			ID:      newRequestID("find-sandbox"),
 			Command: "find",
@@ -483,7 +502,7 @@ func sandboxReadChecker(ctx context.Context, guardianRequestID string) func(stri
 		}
 
 		return false, ""
-	}
+	}}
 }
 
 func formatSandboxDenied(reason string) string {
